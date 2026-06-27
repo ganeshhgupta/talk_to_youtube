@@ -1,447 +1,690 @@
-# YouTube LLM Assistant with TTS, Quiz, Search, Download, Multilingual UI, Chat Memory, and Meme Generation
+# main.py - Talk to YouTube | Powered by Groq
 
 import os
-import streamlit as st
-import requests
-import whisper
-import yt_dlp
-import uuid
-from youtube_transcript_api import YouTubeTranscriptApi
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from sentence_transformers import SentenceTransformer
-from langdetect import detect
-from deep_translator import GoogleTranslator
-from pinecone import Pinecone, ServerlessSpec
-from gtts import gTTS
-import tempfile
+import re
+import json
+import html
 import base64
+import tempfile
 import warnings
-from PIL import Image
-from io import BytesIO
-from dotenv import load_dotenv
+import requests
+from datetime import datetime
+from pathlib import Path
 
-# Load environment variables
+import streamlit as st
+from dotenv import load_dotenv
+from groq import Groq
+from youtube_transcript_api import YouTubeTranscriptApi
+from deep_translator import GoogleTranslator
+from gtts import gTTS
+
+warnings.filterwarnings("ignore")
 load_dotenv()
 
-# === ENV SETUP ===
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-warnings.filterwarnings("ignore")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+THREADS_DIR = Path("threads")
+THREADS_DIR.mkdir(exist_ok=True)
 
-# === CONFIG FROM ENV ===
-class Config:
-    HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
-    MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistralai/Mistral-7B-Instruct-v0.1")
-    PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-    PINECONE_ENV = os.getenv("PINECONE_ENV", "us-east-1")
-    INDEX_NAME = os.getenv("INDEX_NAME", "youtube-assistant")
-    IMGFLIP_USERNAME = os.getenv("IMGFLIP_USERNAME")
-    IMGFLIP_PASSWORD = os.getenv("IMGFLIP_PASSWORD")
-    
-    @classmethod
-    def validate(cls):
-        required_vars = ["HUGGINGFACE_API_KEY", "PINECONE_API_KEY"]
-        missing = [var for var in required_vars if not getattr(cls, var)]
-        if missing:
-            st.error(f"Missing required environment variables: {', '.join(missing)}")
-            st.info("Please set these variables in your .env file")
-            st.stop()
+CHAT_MODEL = "llama-3.3-70b-versatile"
+FAST_MODEL = "llama-3.1-8b-instant"
 
-config = Config()
-config.validate()
 
-# === MODELS ===
+# === GROQ CLIENT ===
+
 @st.cache_resource
-def load_models():
-    embedder = SentenceTransformer("paraphrase-MiniLM-L6-v2", device="cpu")
-    whisper_model = whisper.load_model("base")
-    return embedder, whisper_model
+def get_groq_client():
+    if not GROQ_API_KEY:
+        return None
+    return Groq(api_key=GROQ_API_KEY)
 
-embedder, whisper_model = load_models()
 
-# === PINECONE SETUP ===
-@st.cache_resource
-def setup_pinecone():
-    pc = Pinecone(api_key=config.PINECONE_API_KEY)
-    if config.INDEX_NAME not in pc.list_indexes().names():
-        pc.create_index(
-            name=config.INDEX_NAME, 
-            dimension=384, 
-            metric="cosine", 
-            spec=ServerlessSpec(cloud="aws", region=config.PINECONE_ENV)
+# === VIDEO HELPERS ===
+
+def extract_video_id(url: str) -> str | None:
+    for pattern in [
+        r"(?:v=|youtu\.be/|/embed/|/shorts/)([a-zA-Z0-9_-]{11})",
+        r"^([a-zA-Z0-9_-]{11})$",
+    ]:
+        m = re.search(pattern, url.strip())
+        if m:
+            return m.group(1)
+    return None
+
+
+def get_video_info(video_id: str) -> dict:
+    try:
+        r = requests.get(
+            f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json",
+            timeout=5,
         )
-    return pc.Index(config.INDEX_NAME)
-
-index = setup_pinecone()
-
-# === LLM FUNCTIONS ===
-def mistral_response(prompt):
-    """Generate response using Mistral model via HuggingFace API"""
-    headers = {"Authorization": f"Bearer {config.HUGGINGFACE_API_KEY}"}
-    payload = {
-        "inputs": prompt, 
-        "parameters": {
-            "max_new_tokens": 512, 
-            "temperature": 0.7, 
-            "return_full_text": False
+        data = r.json()
+        return {
+            "title": data.get("title", "Unknown Title"),
+            "author": data.get("author_name", "Unknown Channel"),
+            "thumbnail": f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
         }
-    }
-    
+    except Exception:
+        return {
+            "title": "Unknown Title",
+            "author": "Unknown Channel",
+            "thumbnail": f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
+        }
+
+
+def get_transcript(video_id: str) -> str:
+    # Try English subtitles first
     try:
-        response = requests.post(
-            f"https://api-inference.huggingface.co/models/{config.MISTRAL_MODEL}", 
-            headers=headers, 
-            json=payload,
-            timeout=30
-        )
-        response.raise_for_status()
-        result = response.json()
-        
-        if isinstance(result, list) and len(result) > 0:
-            return result[0].get("generated_text", "Error generating response")
-        return str(result)
-    except requests.exceptions.RequestException as e:
-        return f"API Error: {str(e)}"
+        items = YouTubeTranscriptApi.get_transcript(video_id, languages=["en"])
+        return " ".join(i["text"] for i in items)
+    except Exception:
+        pass
 
-# === TRANSCRIPT FUNCTIONS ===
-def get_transcript(video_id):
-    """Get transcript with fallback methods"""
+    # Try any available transcript, translate if needed
     try:
-        # Try English subtitles first
-        transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
-        text = " ".join([item['text'] for item in transcript])
-        return text, 'en', 'subtitles', text
-    except:
-        try:
-            # Try auto-generated subtitles
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-            for t in transcript_list:
-                if t.is_generated:
-                    fetched = t.fetch()
-                    lang = t.language_code
-                    text = " ".join([item['text'] for item in fetched])
-                    translated = GoogleTranslator(source=lang, target='en').translate(text)
-                    return translated, lang, 'translated-subtitles', text
-        except:
-            # Final fallback: Whisper transcription
-            audio_text, lang = transcribe_audio(video_id)
-            translated = GoogleTranslator(source=lang, target='en').translate(audio_text)
-            return translated, lang, 'whisper-translated', audio_text
+        tlist = YouTubeTranscriptApi.list_transcripts(video_id)
+        for t in tlist:
+            items = t.fetch()
+            text = " ".join(i["text"] for i in items)
+            if t.language_code != "en":
+                # Only translate the first 5000 chars to avoid API limits
+                text = GoogleTranslator(source=t.language_code, target="en").translate(text[:5000])
+            return text
+    except Exception as e:
+        raise RuntimeError(f"Could not fetch transcript: {e}")
 
-def transcribe_audio(video_id):
-    """Transcribe audio using Whisper"""
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    uid = uuid.uuid4().hex[:6]
-    audio_path = f"audio_{uid}.mp3"
-    
-    ydl_opts = {
-        'format': 'bestaudio', 
-        'outtmpl': f"temp_{uid}.%(ext)s", 
-        'quiet': True, 
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3'
-        }]
-    }
-    
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        
-        os.rename(f"temp_{uid}.mp3", audio_path)
-        result = whisper_model.transcribe(audio_path, task="transcribe")
-        
-        return result["text"], result.get("language", "en")
-    finally:
-        # Cleanup
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
 
-# === UTILITY FUNCTIONS ===
-def chunk_text(text):
-    """Split text into chunks for vector storage"""
-    return RecursiveCharacterTextSplitter(
-        chunk_size=500, 
-        chunk_overlap=100
-    ).split_text(text)
+# === GROQ LLM ===
 
-def store_chunks(chunks, namespace):
-    """Store text chunks in Pinecone"""
-    vectors = [
-        {
-            "id": f"{namespace}-{i}", 
-            "values": embedder.encode(chunk).tolist(), 
-            "metadata": {"text": chunk}
-        } 
-        for i, chunk in enumerate(chunks)
-    ]
-    index.upsert(vectors=vectors, namespace=namespace)
-
-def search_similar(query, namespace):
-    """Search for similar chunks in Pinecone"""
-    query_vec = embedder.encode(query).tolist()
-    results = index.query(
-        vector=query_vec, 
-        top_k=5, 
-        include_metadata=True, 
-        namespace=namespace
+def groq_summarize(client: Groq, transcript: str) -> str:
+    resp = client.chat.completions.create(
+        model=FAST_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Summarize the following YouTube video transcript in 3-5 clear, informative sentences. "
+                    "Capture the main topic, key points, and any notable conclusions."
+                ),
+            },
+            {"role": "user", "content": transcript[:30000]},
+        ],
+        max_tokens=512,
+        temperature=0.5,
     )
-    return [match["metadata"]["text"] for match in results["matches"]]
+    return resp.choices[0].message.content
 
-def is_video_processed(namespace):
-    """Check if video is already processed"""
-    try:
-        res = index.query(vector=[0.0]*384, top_k=1, namespace=namespace)
-        return len(res.get("matches", [])) > 0
-    except:
-        return False
 
-def translate(text, source, target):
-    """Translate text between languages"""
-    if source == target:
-        return text
-    return GoogleTranslator(source=source, target=target).translate(text)
+def groq_chat(client: Groq, messages: list[dict], transcript: str) -> str:
+    system_content = (
+        "You are an AI assistant that answers questions about a YouTube video "
+        "based on its transcript. Be helpful, accurate, and concise. "
+        "If something is not in the transcript, say so clearly.\n\n"
+        f"--- VIDEO TRANSCRIPT ---\n{transcript[:100000]}\n--- END TRANSCRIPT ---"
+    )
+    groq_messages = [{"role": "system", "content": system_content}]
+    groq_messages.extend({"role": m["role"], "content": m["content"]} for m in messages)
 
-def tts_playback(text, lang='en'):
-    """Generate TTS audio for text"""
+    resp = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=groq_messages,
+        max_tokens=1024,
+        temperature=0.7,
+    )
+    return resp.choices[0].message.content
+
+
+# === THREAD STORAGE ===
+
+def thread_path(video_id: str) -> Path:
+    return THREADS_DIR / f"{video_id}.json"
+
+
+def load_thread(video_id: str) -> dict | None:
+    p = thread_path(video_id)
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    return None
+
+
+def save_thread(thread: dict) -> None:
+    p = thread_path(thread["video_id"])
+    p.write_text(json.dumps(thread, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def list_threads() -> list[dict]:
+    threads = []
+    for f in THREADS_DIR.glob("*.json"):
+        try:
+            threads.append(json.loads(f.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    return sorted(threads, key=lambda x: x.get("last_updated", ""), reverse=True)
+
+
+def delete_thread(video_id: str) -> None:
+    p = thread_path(video_id)
+    if p.exists():
+        p.unlink()
+
+
+# === TTS ===
+
+def tts_audio_tag(text: str, lang: str = "en") -> str:
     if not text.strip():
         return ""
-    
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
-            gTTS(text=text, lang=lang).save(fp.name)
-            with open(fp.name, 'rb') as audio_file:
-                audio_base64 = base64.b64encode(audio_file.read()).decode()
-            os.unlink(fp.name)
-            return f'<audio controls><source src="data:audio/mp3;base64,{audio_base64}" type="audio/mp3"></audio>'
-    except Exception as e:
-        st.warning(f"TTS failed: {str(e)}")
+            gTTS(text=text[:500], lang=lang).save(fp.name)
+            audio_b64 = base64.b64encode(open(fp.name, "rb").read()).decode()
+        os.unlink(fp.name)
+        return (
+            f'<audio controls style="width:100%;margin-top:8px">'
+            f'<source src="data:audio/mp3;base64,{audio_b64}" type="audio/mp3">'
+            f"</audio>"
+        )
+    except Exception:
         return ""
 
-def generate_quiz(summary):
-    """Generate quiz questions from summary"""
-    prompt = f"Create 3 multiple choice quiz questions with answers from the following summary:\n{summary}"
-    return mistral_response(prompt)
 
-def generate_meme_caption(summary):
-    """Generate meme caption from summary"""
-    prompt = f"Create a funny, relatable meme caption about this video summary (keep it short and punchy):\n{summary}"
-    return mistral_response(prompt)
+# === CSS ===
 
-def create_imgflip_meme(caption):
-    """Create meme using ImgFlip API"""
-    if not config.IMGFLIP_USERNAME or not config.IMGFLIP_PASSWORD:
-        return None, "ImgFlip credentials not configured"
-    
-    imgflip_api_url = "https://api.imgflip.com/caption_image"
-    meme_templates = ["181913649", "112126428", "102156234"]  # Drake, Distracted Boyfriend, Mocking Spongebob
-    
-    caption_parts = caption.split(".")
-    text0 = caption_parts[0] if len(caption_parts) > 0 else caption[:50]
-    text1 = caption_parts[-1] if len(caption_parts) > 1 else caption[50:100]
-    
-    meme_payload = {
-        'template_id': meme_templates[0],
-        'username': config.IMGFLIP_USERNAME,
-        'password': config.IMGFLIP_PASSWORD,
-        'text0': text0,
-        'text1': text1
-    }
-    
-    try:
-        response = requests.post(imgflip_api_url, data=meme_payload, timeout=10)
-        response.raise_for_status()
-        result = response.json()
-        
-        if result.get("success"):
-            return result['data']['url'], None
-        else:
-            return None, result.get("error_message", "Unknown error")
-    except requests.exceptions.RequestException as e:
-        return None, f"Request failed: {str(e)}"
+YOUTUBE_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap');
 
-def generate_ai_meme(caption):
-    """Generate AI meme using HuggingFace"""
-    dalle_prompt = f"Create a funny meme image that reflects this caption: '{caption}'"
-    
-    try:
-        response = requests.post(
-            "https://api-inference.huggingface.co/models/openskyml/dalle-3",
-            headers={"Authorization": f"Bearer {config.HUGGINGFACE_API_KEY}"},
-            json={"inputs": dalle_prompt},
-            timeout=30
-        )
-        
-        if response.status_code == 200:
-            return Image.open(BytesIO(response.content))
-        else:
-            return None
-    except Exception as e:
-        st.warning(f"AI meme generation failed: {str(e)}")
-        return None
+html, body, [class*="css"] {
+    font-family: 'Roboto', 'Arial', sans-serif;
+}
+.stApp {
+    background-color: #0f0f0f;
+    color: #ffffff;
+}
 
-# === STREAMLIT UI ===
+/* --- Sidebar --- */
+section[data-testid="stSidebar"] {
+    background-color: #212121 !important;
+    border-right: 1px solid #303030;
+}
+section[data-testid="stSidebar"] * {
+    color: #ffffff;
+}
+
+/* --- Inputs --- */
+.stTextInput input, .stChatInput textarea {
+    background-color: #121212 !important;
+    color: #ffffff !important;
+    border: 1.5px solid #303030 !important;
+    border-radius: 24px !important;
+    padding: 10px 18px !important;
+    font-size: 15px !important;
+}
+.stTextInput input:focus {
+    border-color: #1c62b9 !important;
+    box-shadow: 0 0 0 2px rgba(28,98,185,0.25) !important;
+}
+[data-testid="stChatInput"] {
+    background-color: #1a1a1a !important;
+    border-top: 1px solid #303030 !important;
+    border-radius: 0 !important;
+    padding: 12px 16px !important;
+}
+
+/* --- Buttons --- */
+.stButton > button {
+    background-color: #cc0000 !important;
+    color: #ffffff !important;
+    border: none !important;
+    border-radius: 20px !important;
+    padding: 8px 20px !important;
+    font-weight: 500 !important;
+    font-size: 14px !important;
+    transition: background 0.2s ease !important;
+}
+.stButton > button:hover {
+    background-color: #aa0000 !important;
+}
+
+/* --- Chat messages --- */
+[data-testid="stChatMessage"] {
+    background-color: #1e1e1e !important;
+    border-radius: 12px !important;
+    padding: 12px 16px !important;
+    margin: 6px 0 !important;
+    border: 1px solid #2a2a2a !important;
+}
+[data-testid="stChatMessage"][data-message-author-role="user"] {
+    background-color: #1a2744 !important;
+    border-color: #1c3a6e !important;
+}
+[data-testid="stChatMessage"][data-message-author-role="assistant"] {
+    background-color: #1e1e1e !important;
+}
+
+/* --- Video info card --- */
+.yt-video-card {
+    background: #1e1e1e;
+    border-radius: 12px;
+    padding: 16px;
+    margin: 16px 0;
+    border: 1px solid #303030;
+    display: flex;
+    gap: 16px;
+    align-items: flex-start;
+}
+.yt-video-card img {
+    border-radius: 8px;
+    width: 240px;
+    min-width: 240px;
+    height: 135px;
+    object-fit: cover;
+}
+.yt-video-card-info h2 {
+    margin: 0 0 6px 0;
+    font-size: 18px;
+    font-weight: 600;
+    color: #fff;
+    line-height: 1.3;
+}
+.yt-video-card-info .channel {
+    font-size: 13px;
+    color: #aaaaaa;
+    margin-bottom: 8px;
+}
+.yt-badge {
+    display: inline-block;
+    background: #cc0000;
+    color: white;
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+}
+.yt-meta {
+    font-size: 12px;
+    color: #666;
+    margin-top: 10px;
+}
+
+/* --- Summary box --- */
+.yt-summary {
+    background: #1a1a1a;
+    border-left: 3px solid #cc0000;
+    border-radius: 0 8px 8px 0;
+    padding: 14px 18px;
+    color: #cccccc;
+    font-size: 14px;
+    line-height: 1.8;
+    margin: 12px 0 20px 0;
+}
+
+/* --- Section headers --- */
+.yt-section-header {
+    font-size: 16px;
+    font-weight: 600;
+    color: #ffffff;
+    margin: 20px 0 10px 0;
+    padding-bottom: 8px;
+    border-bottom: 1px solid #303030;
+}
+
+/* --- Thread card (sidebar) --- */
+.thread-card {
+    background: #2d2d2d;
+    border-radius: 10px;
+    padding: 10px;
+    margin: 6px 0;
+    border: 1.5px solid transparent;
+}
+.thread-card.active {
+    border-color: #cc0000;
+    background: #3a1a1a;
+}
+.thread-card-thumb {
+    border-radius: 6px;
+    width: 100%;
+    height: 72px;
+    object-fit: cover;
+    margin-bottom: 6px;
+    display: block;
+}
+.thread-title {
+    font-size: 12px;
+    color: #eee;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 180px;
+}
+.thread-meta {
+    font-size: 10px;
+    color: #888;
+    margin-top: 2px;
+}
+
+/* --- Logo --- */
+.yt-logo {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 20px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid #303030;
+}
+.yt-logo-icon {
+    background: #cc0000;
+    color: white;
+    width: 36px;
+    height: 26px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    font-weight: 900;
+    flex-shrink: 0;
+}
+.yt-logo-text {
+    font-size: 18px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: -0.5px;
+}
+
+/* --- Page hero --- */
+.yt-hero {
+    text-align: center;
+    margin: 8px 0 28px 0;
+}
+.yt-hero h1 {
+    font-size: 28px;
+    font-weight: 700;
+    color: #fff;
+    margin-bottom: 6px;
+}
+.yt-hero p {
+    font-size: 14px;
+    color: #aaa;
+}
+
+/* --- Empty state --- */
+.yt-empty {
+    text-align: center;
+    margin-top: 80px;
+}
+.yt-empty-icon {
+    font-size: 64px;
+    opacity: 0.3;
+}
+.yt-empty-text {
+    color: #555;
+    font-size: 15px;
+    margin-top: 16px;
+}
+
+/* --- Spinners / misc --- */
+.stSpinner > div { border-top-color: #cc0000 !important; }
+.stAlert { border-radius: 10px !important; }
+div[data-testid="stExpander"] {
+    border: 1px solid #303030 !important;
+    border-radius: 10px !important;
+    background: #1a1a1a !important;
+}
+</style>
+"""
+
+
+# === MAIN ===
+
 def main():
-    st.set_page_config(page_title="YouTube LLM Assistant", layout="wide")
-    st.title("🧠 YouTube LLM Assistant Pro")
-    st.markdown("*Powered by Mistral, Whisper, and Pinecone*")
-    
-    # Initialize session state
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-    
-    # Input section
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        video_url = st.text_input("📺 Paste YouTube video URL", placeholder="https://www.youtube.com/watch?v=...")
-    with col2:
-        force_reprocess = st.checkbox("♻️ Reprocess", help="Force reprocessing even if video was already processed")
-    
-    if not video_url:
-        st.info("👆 Enter a YouTube URL to get started")
+    st.set_page_config(
+        page_title="Talk to YouTube",
+        page_icon="▶️",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    st.markdown(YOUTUBE_CSS, unsafe_allow_html=True)
+
+    client = get_groq_client()
+
+    # ── Sidebar ──────────────────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown(
+            '<div class="yt-logo">'
+            '<div class="yt-logo-icon">▶</div>'
+            '<div class="yt-logo-text">Talk to YouTube</div>'
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+        threads = list_threads()
+        if threads:
+            st.markdown(
+                '<div class="yt-section-header">Your Chats</div>',
+                unsafe_allow_html=True,
+            )
+            for t in threads:
+                vid_id = t["video_id"]
+                is_active = st.session_state.get("current_video_id") == vid_id
+                card_cls = "thread-card active" if is_active else "thread-card"
+                msg_count = len([m for m in t.get("messages", []) if m["role"] == "user"])
+                title_safe = html.escape(t.get("title", "Unknown")[:45])
+                author_safe = html.escape(t.get("author", "")[:28])
+
+                st.markdown(
+                    f'<div class="{card_cls}">'
+                    f'<img class="thread-card-thumb" src="{t.get("thumbnail","")}" '
+                    f'onerror="this.style.display=\'none\'">'
+                    f'<div class="thread-title">{title_safe}</div>'
+                    f'<div class="thread-meta">{author_safe} &bull; {msg_count} questions</div>'
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+                c1, c2 = st.columns([4, 1])
+                with c1:
+                    if st.button("Open", key=f"open_{vid_id}", use_container_width=True):
+                        st.session_state.current_video_id = vid_id
+                        st.session_state.input_url = f"https://www.youtube.com/watch?v={vid_id}"
+                        st.rerun()
+                with c2:
+                    if st.button("🗑", key=f"del_{vid_id}"):
+                        delete_thread(vid_id)
+                        if st.session_state.get("current_video_id") == vid_id:
+                            st.session_state.pop("current_video_id", None)
+                            st.session_state.pop("input_url", None)
+                        st.rerun()
+        else:
+            st.markdown(
+                '<div style="color:#666;font-size:13px;padding:8px 0">'
+                "No chats yet. Paste a YouTube URL to start."
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+        if not GROQ_API_KEY:
+            st.error("⚠️ GROQ_API_KEY missing from .env")
+
+    # ── Main area ─────────────────────────────────────────────────────────────
+    st.markdown(
+        '<div class="yt-hero">'
+        "<h1>Talk to any YouTube video</h1>"
+        "<p>Paste a URL, get an AI summary, then chat about the content</p>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    url_col, btn_col = st.columns([6, 1])
+    with url_col:
+        video_url = st.text_input(
+            "url",
+            label_visibility="collapsed",
+            placeholder="https://www.youtube.com/watch?v=...",
+            value=st.session_state.get("input_url", ""),
+            key="url_input",
+        )
+    with btn_col:
+        load_btn = st.button("Load ▶", use_container_width=True)
+
+    if load_btn and video_url:
+        vid_id = extract_video_id(video_url)
+        if vid_id:
+            st.session_state.current_video_id = vid_id
+            st.session_state.input_url = video_url
+        else:
+            st.error("Invalid YouTube URL. Paste a link like: https://youtube.com/watch?v=...")
+
+    current_video_id = st.session_state.get("current_video_id")
+
+    if not current_video_id:
+        st.markdown(
+            '<div class="yt-empty">'
+            '<div class="yt-empty-icon">▶️</div>'
+            '<div class="yt-empty-text">Enter a YouTube URL above to get started</div>'
+            "</div>",
+            unsafe_allow_html=True,
+        )
         return
-    
-    try:
-        video_id = video_url.split("v=")[-1].split("&")[0]
-        
-        # Processing section
-        with st.spinner("🔍 Processing video..."):
-            if not force_reprocess and is_video_processed(video_id):
-                st.success("✅ Video already processed. Using cached data.")
-            else:
-                # Get transcript
-                result = get_transcript(video_id)
-                if len(result) == 4:
-                    transcript_en, lang, source, raw_transcript = result
-                else:
-                    transcript_en, lang, source = result
-                    raw_transcript = transcript_en
-                
-                # Process and store
-                chunks = chunk_text(transcript_en)
-                store_chunks(chunks, video_id)
-                
-                # Generate summary
-                summary_en = mistral_response(f"Summarize this video transcript in 2-3 sentences:\n{transcript_en[:2000]}")
-                summary_native = translate(summary_en, 'en', lang) if lang != 'en' else summary_en
-                
-                # Display results
-                st.subheader("📝 Summary")
-                st.markdown(f"**English:** {summary_en}")
-                if lang != 'en':
-                    st.markdown(f"**{lang.upper()}:** {summary_native}")
-                
-                # TTS for summary
-                if summary_en:
-                    st.markdown(tts_playback(summary_en), unsafe_allow_html=True)
-                
-                # Transcript
-                with st.expander("📜 View Full Transcript"):
-                    st.text_area("Transcript", raw_transcript, height=300, key="transcript_display")
-                
-                # Quiz generation
-                st.subheader("🧠 Quiz Questions")
-                with st.spinner("Generating quiz..."):
-                    quiz = generate_quiz(summary_en)
-                    st.text_area("Quiz Questions", quiz, height=200, key="quiz_display")
-                
-                # Meme generation
-                st.subheader("🎭 Meme Generation")
-                with st.spinner("Creating meme..."):
-                    meme_caption = generate_meme_caption(summary_en)
-                    st.text_area("Meme Caption", meme_caption, height=100, key="meme_caption")
-                    
-                    # Traditional meme
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.markdown("**📸 Traditional Meme**")
-                        meme_url, error = create_imgflip_meme(meme_caption)
-                        if meme_url:
-                            st.image(meme_url, caption=meme_caption)
-                            st.markdown(f"[🔗 View Full Size]({meme_url})")
-                        else:
-                            st.warning(f"Failed to generate meme: {error}")
-                    
-                    with col2:
-                        st.markdown("**🤖 AI-Generated Meme**")
-                        ai_meme = generate_ai_meme(meme_caption)
-                        if ai_meme:
-                            st.image(ai_meme, caption=meme_caption)
-                        else:
-                            st.warning("AI meme generation failed")
-                
-                # Search functionality
-                st.subheader("🔍 Search Transcript")
-                search_query = st.text_input("Search for specific content", placeholder="Enter keywords...")
-                if search_query:
-                    matching_chunks = [chunk for chunk in chunks if search_query.lower() in chunk.lower()]
-                    if matching_chunks:
-                        st.markdown(f"Found {len(matching_chunks)} matches:")
-                        for i, match in enumerate(matching_chunks[:5]):  # Show top 5
-                            st.markdown(f"**Match {i+1}:**")
-                            st.markdown(f"> {match}")
-                    else:
-                        st.info("No matches found")
-                
-                # Download section
-                st.subheader("⬇️ Downloads")
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.download_button("📝 Download Summary", summary_en, file_name="summary.txt", mime="text/plain")
-                with col2:
-                    st.download_button("📜 Download Transcript", raw_transcript, file_name="transcript.txt", mime="text/plain")
-                with col3:
-                    st.download_button("🧠 Download Quiz", quiz, file_name="quiz.txt", mime="text/plain")
-        
-        # Chat section
-        st.subheader("💬 Chat with the Video")
-        
-        # Display chat history
-        if st.session_state.chat_history:
-            st.markdown("**Previous Questions:**")
-            for i, (question, answer) in enumerate(st.session_state.chat_history[-3:]):  # Show last 3
-                if answer:
-                    with st.expander(f"Q{i+1}: {question[:50]}..." if len(question) > 50 else f"Q{i+1}: {question}"):
-                        st.markdown(f"**Answer:** {answer}")
-        
-        # New question input
-        question = st.text_input("❓ Ask a question about the video", placeholder="What is the main topic discussed?")
-        
-        if st.button("🚀 Get Answer", type="primary"):
-            if question:
-                with st.spinner("Thinking..."):
-                    # Detect language and translate if needed
-                    question_lang = detect(question)
-                    question_en = translate(question, question_lang, 'en')
-                    
-                    # Search for relevant chunks
-                    relevant_chunks = search_similar(question_en, video_id)
-                    context = "\n".join(relevant_chunks)
-                    
-                    # Generate answer
-                    prompt = f"Based on this context from a video transcript, answer the question:\n\nContext:\n{context}\n\nQuestion: {question_en}\n\nAnswer:"
-                    answer_en = mistral_response(prompt)
-                    
-                    # Translate back if needed
-                    answer_native = translate(answer_en, 'en', question_lang) if question_lang != 'en' else answer_en
-                    
-                    # Store in history
-                    st.session_state.chat_history.append((question, answer_en))
-                    
-                    # Display answer
-                    st.markdown("### 🤖 Answer")
-                    st.markdown(f"**English:** {answer_en}")
-                    if question_lang != 'en':
-                        st.markdown(f"**{question_lang.upper()}:** {answer_native}")
-                    
-                    # TTS for answer
-                    if answer_en:
-                        st.markdown(tts_playback(answer_en), unsafe_allow_html=True)
-            else:
-                st.warning("Please enter a question")
-    
-    except Exception as e:
-        st.error(f"❌ Error processing video: {str(e)}")
-        st.info("Please check if the video URL is valid and the video has captions or audio")
+
+    if not client:
+        st.error("GROQ_API_KEY not set. Add it to your .env file and restart.")
+        return
+
+    # ── Load or create thread ─────────────────────────────────────────────────
+    thread = load_thread(current_video_id)
+
+    if thread is None:
+        with st.spinner("Fetching transcript..."):
+            info = get_video_info(current_video_id)
+            try:
+                transcript = get_transcript(current_video_id)
+            except RuntimeError as e:
+                st.error(str(e))
+                st.info("The video may not have captions enabled. Try a different video.")
+                return
+
+        with st.spinner("Summarizing with Groq..."):
+            summary = groq_summarize(client, transcript)
+
+        thread = {
+            "video_id": current_video_id,
+            "url": f"https://www.youtube.com/watch?v={current_video_id}",
+            "title": info["title"],
+            "author": info["author"],
+            "thumbnail": info["thumbnail"],
+            "transcript": transcript,
+            "summary": summary,
+            "created_at": datetime.now().isoformat(),
+            "last_updated": datetime.now().isoformat(),
+            "messages": [],
+        }
+        save_thread(thread)
+        st.rerun()
+
+    # ── Video info card ───────────────────────────────────────────────────────
+    word_count = len(thread.get("transcript", "").split())
+    title_safe = html.escape(thread["title"])
+    author_safe = html.escape(thread["author"])
+
+    st.markdown(
+        f'<div class="yt-video-card">'
+        f'<img src="{thread["thumbnail"]}" '
+        f'onerror="this.src=\'https://img.youtube.com/vi/{current_video_id}/hqdefault.jpg\'">'
+        f'<div class="yt-video-card-info">'
+        f"<h2>{title_safe}</h2>"
+        f'<div class="channel">{author_safe}</div>'
+        f'<span class="yt-badge">▶ YouTube</span>'
+        f'<div class="yt-meta">{word_count:,} words in transcript</div>'
+        f"</div></div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    st.markdown(
+        '<div class="yt-section-header">AI Summary</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f'<div class="yt-summary">{html.escape(thread["summary"])}</div>',
+        unsafe_allow_html=True,
+    )
+
+    col_a, col_b = st.columns([1, 1])
+    with col_a:
+        with st.expander("View Full Transcript"):
+            st.text_area(
+                "transcript",
+                thread.get("transcript", ""),
+                height=240,
+                label_visibility="collapsed",
+            )
+    with col_b:
+        with st.expander("Download"):
+            st.download_button(
+                "Download Transcript",
+                thread.get("transcript", ""),
+                file_name=f"transcript_{current_video_id}.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
+            st.download_button(
+                "Download Summary",
+                thread.get("summary", ""),
+                file_name=f"summary_{current_video_id}.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
+            if st.button("🔄 Reprocess Video", use_container_width=True):
+                delete_thread(current_video_id)
+                st.session_state.pop("current_video_id", None)
+                st.session_state.pop("input_url", None)
+                st.rerun()
+
+    # ── Chat interface ────────────────────────────────────────────────────────
+    st.markdown(
+        '<div class="yt-section-header">Chat with this video</div>',
+        unsafe_allow_html=True,
+    )
+
+    messages = thread.get("messages", [])
+
+    # Render history
+    for msg in messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # Clear button (only show if there are messages)
+    if messages:
+        if st.button("Clear chat history"):
+            thread["messages"] = []
+            thread["last_updated"] = datetime.now().isoformat()
+            save_thread(thread)
+            st.rerun()
+
+    # New message input
+    if user_input := st.chat_input("Ask anything about this video..."):
+        messages.append({
+            "role": "user",
+            "content": user_input,
+            "timestamp": datetime.now().isoformat(),
+        })
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        with st.chat_message("assistant"):
+            with st.spinner(""):
+                response = groq_chat(client, messages, thread["transcript"])
+            st.markdown(response)
+
+        messages.append({
+            "role": "assistant",
+            "content": response,
+            "timestamp": datetime.now().isoformat(),
+        })
+        thread["messages"] = messages
+        thread["last_updated"] = datetime.now().isoformat()
+        save_thread(thread)
+
 
 if __name__ == "__main__":
     main()
