@@ -1,0 +1,22 @@
+# Next.js
+.next/
+out/
+node_modules/
+
+# Environment
+.env
+.env.local
+.env*.local
+
+# Chat threads (local data)
+threads/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
