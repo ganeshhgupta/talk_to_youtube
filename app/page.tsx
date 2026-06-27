@@ -33,8 +33,12 @@ export default function Home() {
         body: JSON.stringify({ url }),
       });
       if (!res.ok) {
-        const { error: msg } = await res.json();
-        throw new Error(msg ?? 'Failed to load video');
+        let msg = `Server error (${res.status})`;
+        try {
+          const data = await res.json();
+          msg = data.error ?? msg;
+        } catch { /* response was not JSON */ }
+        throw new Error(msg);
       }
       const thread: Thread = await res.json();
       setCurrent(thread);
