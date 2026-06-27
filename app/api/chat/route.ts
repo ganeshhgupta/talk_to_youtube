@@ -26,7 +26,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    const groq = new Groq({ apiKey });
+    const groq = new Groq({ apiKey, maxRetries: 3 });
 
     const systemContent =
       `You are an AI assistant that answers questions about a YouTube video based on its transcript. ` +

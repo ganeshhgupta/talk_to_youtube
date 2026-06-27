@@ -3,6 +3,49 @@ import Groq from 'groq-sdk';
 import { extractVideoId, fetchTranscript, fetchVideoInfo } from '@/lib/transcript';
 import { getThread, saveThread } from '@/lib/threads';
 
+// Collect a streaming Groq response — more resilient to network blips than one-shot fetch
+async function streamingComplete(
+  groq: Groq,
+  messages: Groq.Chat.ChatCompletionMessageParam[],
+  model: string,
+  maxTokens: number
+): Promise<string> {
+  const stream = await groq.chat.completions.create({
+    model,
+    messages,
+    max_tokens: maxTokens,
+    temperature: 0.5,
+    stream: true,
+  });
+  let text = '';
+  for await (const chunk of stream) {
+    text += chunk.choices[0]?.delta?.content ?? '';
+  }
+  return text;
+}
+
+// Retry wrapper for transient network errors
+async function withRetry<T>(fn: () => Promise<T>, attempts = 3, delayMs = 1200): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      const msg = String(e).toLowerCase();
+      const isTransient =
+        msg.includes('premature close') ||
+        msg.includes('fetch failed') ||
+        msg.includes('econnreset') ||
+        msg.includes('socket hang up') ||
+        msg.includes('network');
+      if (!isTransient) throw e;
+      if (i < attempts - 1) await new Promise((r) => setTimeout(r, delayMs * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
 export async function POST(req: NextRequest) {
   try {
     const apiKey = process.env.GROQ_API_KEY;
@@ -35,24 +78,27 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const info = await fetchVideoInfo(videoId);
+    const [info] = await Promise.all([fetchVideoInfo(videoId)]);
 
     const groq = new Groq({ apiKey });
 
-    // Summarize
-    const summaryRes = await groq.chat.completions.create({
-      model: 'llama-3.1-8b-instant',
-      messages: [
-        {
-          role: 'system',
-          content:
-            'Summarize this YouTube video transcript in 3-5 clear, informative sentences. Capture the main topic, key points, and any notable conclusions.',
-        },
-        { role: 'user', content: transcript.slice(0, 30000) },
-      ],
-      max_tokens: 512,
-      temperature: 0.5,
-    });
+    // Summarize — use streaming + retry for reliability
+    const summary = await withRetry(() =>
+      streamingComplete(
+        groq,
+        [
+          {
+            role: 'system',
+            content:
+              'Summarize this YouTube video transcript in 3-5 clear, informative sentences. Capture the main topic, key points, and any notable conclusions.',
+          },
+          // Send only the first 12k chars to keep payload small and fast
+          { role: 'user', content: transcript.slice(0, 12000) },
+        ],
+        'llama-3.1-8b-instant',
+        400
+      )
+    );
 
     const thread = {
       video_id: videoId,
@@ -61,7 +107,7 @@ export async function POST(req: NextRequest) {
       author: info.author,
       thumbnail: info.thumbnail,
       transcript,
-      summary: summaryRes.choices[0].message.content ?? '',
+      summary,
       created_at: new Date().toISOString(),
       last_updated: new Date().toISOString(),
       messages: [],
